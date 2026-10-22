@@ -1,0 +1,8 @@
+.godot/
+.DS_Store
+*.tmp
+build/
+site/
+.venv/
+__pycache__/
+/android/

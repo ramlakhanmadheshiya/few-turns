@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <g transform="translate(512 512) scale(0.6) translate(-527 -513)">
+  <!-- start: a ring the orb sets off from -->
+  <circle cx="300" cy="730" r="62" fill="none" stroke="#FFFFFF" stroke-width="22"/>
+  <!-- the way up, dotted -->
+  <g fill="#FFFFFF" opacity="0.75"><circle cx="300" cy="640" r="15"/><circle cx="300" cy="585" r="15"/><circle cx="300" cy="530" r="15"/><circle cx="300" cy="475" r="15"/></g>
+  <!-- the one arrow you laid: it turns the orb right -->
+  <rect x="216" y="246" width="168" height="168" rx="40" fill="none" stroke="#FFFFFF" stroke-width="22"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="30" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="252" y1="330" x2="348" y2="330"/>
+    <polyline points="308,290 348,330 308,370"/>
+  </g>
+  <g fill="#FFFFFF" opacity="0.75"><circle cx="430" cy="330" r="15"/><circle cx="482" cy="330" r="15"/></g>
+  <!-- the orb, rolling home -->
+  
+  <circle cx="572" cy="330" r="44" fill="#FFFFFF"/>
+  <!-- home -->
+  <circle cx="770" cy="330" r="80" fill="none" stroke="#FFFFFF" stroke-width="22"/>
+  <circle cx="770" cy="330" r="24" fill="#FFFFFF"/>
+  </g>
+</svg>

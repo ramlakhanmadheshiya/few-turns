@@ -1,0 +1,238 @@
+name: Build & publish
+
+# Tests the game, exports a signed Android APK and a web build, then ships both
+# to theramlakhan.com/BrainnovaStudio/games/few-turns/ (tools/ship.sh).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  # Set only when the Play upload secret exists (used to skip that step otherwise).
+  PLAY_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' && 'yes' || '' }}
+  GODOT_VERSION: 4.7.2
+  GODOT_RELEASE: 4.7.2-stable
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache Godot
+        id: cache-godot
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/godot
+            ~/.local/share/godot/export_templates
+          key: godot-${{ env.GODOT_RELEASE }}
+
+      - name: Download Godot and export templates
+        if: steps.cache-godot.outputs.cache-hit != 'true'
+        run: |
+          base="https://github.com/godotengine/godot-builds/releases/download/${GODOT_RELEASE}"
+          mkdir -p ~/godot
+          curl -fsSL -o /tmp/godot.zip "$base/Godot_v${GODOT_RELEASE}_linux.x86_64.zip"
+          unzip -q /tmp/godot.zip -d ~/godot
+          curl -fsSL -o /tmp/templates.tpz "$base/Godot_v${GODOT_RELEASE}_export_templates.tpz"
+          unzip -q /tmp/templates.tpz -d /tmp/tpl
+          dest="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          mkdir -p "$dest"
+          mv /tmp/tpl/templates/* "$dest/"
+
+      - name: Put Godot on PATH
+        run: |
+          ln -sf ~/godot/Godot_v${GODOT_RELEASE}_linux.x86_64 /usr/local/bin/godot
+          godot --version
+
+      - name: Import project
+        run: godot --headless --path . --import || true
+
+      - name: Run tests
+        run: ./tests/run_all.sh
+
+      - name: Configure Android signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS }}
+        run: |
+          ks="$RUNNER_TEMP/release.keystore"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$ks"
+          else
+            echo "::warning::No release keystore secret; signing with a throwaway key."
+            KEYSTORE_PASSWORD=android; KEYSTORE_ALIAS=few-turns
+            keytool -genkeypair -keystore "$ks" -storepass android -keypass android -alias few-turns \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Few Turns"
+          fi
+          {
+            echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$ks"
+            echo "GODOT_ANDROID_KEYSTORE_RELEASE_USER=$KEYSTORE_ALIAS"
+            echo "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD=$KEYSTORE_PASSWORD"
+          } >> "$GITHUB_ENV"
+          # Godot reads SDK/JDK paths (and needs a debug keystore) from editor settings.
+          keytool -genkeypair -keystore "$RUNNER_TEMP/debug.keystore" -storepass android -keypass android \
+            -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug"
+          major_minor="${GODOT_VERSION%.*}"
+          mkdir -p ~/.config/godot
+          cat > ~/.config/godot/editor_settings-${major_minor}.tres <<EOF
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "${ANDROID_HOME}"
+          export/android/java_sdk_path = "${JAVA_HOME}"
+          export/android/debug_keystore = "$RUNNER_TEMP/debug.keystore"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          EOF
+
+      - name: Android SDK packages
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.1.0" > /dev/null
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+
+      - name: Build the share plugin (Android library)
+        # Saves the share picture to the gallery and shares it (see plugins_src/fewturns_share).
+        run: |
+          gradle -p plugins_src/fewturns_share assembleRelease --no-daemon --stacktrace
+          mkdir -p addons/fewturns_share/bin
+          cp plugins_src/fewturns_share/build/outputs/aar/fewturns_share-release.aar addons/fewturns_share/bin/
+          ls -l addons/fewturns_share/bin
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ env.GODOT_RELEASE }}-${{ hashFiles('addons/**/*.gd') }}
+          restore-keys: gradle-${{ env.GODOT_RELEASE }}-
+
+      - name: Stamp version
+        run: |
+          sed -i "s/^version\/code=.*/version\/code=${{ github.run_number }}/" export_presets.cfg
+          sed -i "s/^version\/name=.*/version\/name=\"1.0.${{ github.run_number }}\"/" export_presets.cfg
+          sed -i "s/^config\/version=.*/config\/version=\"1.0.${{ github.run_number }}\"/" project.godot
+
+      - name: Real AdMob IDs (from secrets)
+        # Without these secrets the builds keep Google's TEST ad units, which is
+        # right for development but must not reach Play.
+        env:
+          ADMOB_APP_ID: ${{ secrets.ADMOB_APP_ID }}
+          ADMOB_BANNER_ID: ${{ secrets.ADMOB_BANNER_ID }}
+          ADMOB_REWARDED_ID: ${{ secrets.ADMOB_REWARDED_ID }}
+          ADMOB_INTERSTITIAL_ID: ${{ secrets.ADMOB_INTERSTITIAL_ID }}
+        run: |
+          if [ -z "$ADMOB_APP_ID" ] || [ -z "$ADMOB_BANNER_ID" ] || [ -z "$ADMOB_REWARDED_ID" ] || [ -z "$ADMOB_INTERSTITIAL_ID" ]; then
+            echo "::warning::AdMob secrets not set: this build uses Google's TEST ad units. Add ADMOB_APP_ID, ADMOB_BANNER_ID, ADMOB_REWARDED_ID and ADMOB_INTERSTITIAL_ID before releasing on Play."
+            exit 0
+          fi
+          {
+            echo ""
+            echo "[admob]"
+            echo ""
+            echo "general/android/app_id=\"$ADMOB_APP_ID\""
+            echo ""
+            echo "[few_turns]"
+            echo ""
+            echo "ads/android_banner_id=\"$ADMOB_BANNER_ID\""
+            echo "ads/android_rewarded_id=\"$ADMOB_REWARDED_ID\""
+            echo "ads/android_interstitial_id=\"$ADMOB_INTERSTITIAL_ID\""
+          } >> project.godot
+          echo "Using the real AdMob app and ad units."
+
+      - name: Export Android APK
+        run: |
+          mkdir -p build/android
+          # Installs Godot's Gradle template, then the AdMob/Billing plugins patch it.
+          godot --headless --path . --install-android-build-template --export-release "Android" build/android/few-turns.apk
+          test -s build/android/few-turns.apk
+          ls -lh build/android
+
+      - name: Export Android App Bundle (for Google Play)
+        run: |
+          godot --headless --path . --export-release "Android AAB" build/android/few-turns.aab
+          test -s build/android/few-turns.aab
+          ls -lh build/android
+
+      - name: Slim web engine (Brainnova)
+        # 2D-only Godot web engine shared by every Brainnova game (smaller, faster to start).
+        run: curl -fsSL https://raw.githubusercontent.com/ramlakhanmadheshiya/BrainnovaStudio/main/tools/slim-engine.sh | bash
+
+      - name: Export web build
+        run: |
+          mkdir -p build/web
+          godot --headless --path . --export-release "Web" build/web/index.html
+          test -s build/web/index.pck
+
+      - name: Ship to Brainnova Studio
+        # APK, web pack, streamed music, help and privacy go to
+        # theramlakhan.com/BrainnovaStudio/games/few-turns/ (and /play/few-turns/).
+        # Also writes ./stubs: the old theramlakhan.com/few-turns/ addresses, redirecting.
+        env:
+          STUDIO_DEPLOY_KEY: ${{ secrets.STUDIO_DEPLOY_KEY }}
+        run: curl -fsSL https://raw.githubusercontent.com/ramlakhanmadheshiya/BrainnovaStudio/main/tools/ship.sh | bash -s -- few-turns "1.0.${{ github.run_number }}"
+
+      - name: Publish APK as a GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="v1.0.${{ github.run_number }}"
+          gh release create "$tag" build/android/few-turns.apk \
+            --title "Few Turns $tag" \
+            --notes "Android build of ${GITHUB_SHA::7}. Install: download few-turns.apk on your phone and open it." \
+            --latest
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: few-turns-apk
+          path: build/android/few-turns.apk
+
+      - name: Upload App Bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: few-turns-aab
+          path: build/android/few-turns.aab
+
+      - name: Upload to Google Play (internal testing)
+        # Runs once the repository has a PLAY_SERVICE_ACCOUNT_JSON secret (a
+        # service account invited in Play Console with release rights) and the app
+        # exists in Play Console with a first bundle uploaded by hand.
+        if: ${{ env.PLAY_JSON != '' }}
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.theramlakhan.fewturns
+          releaseFiles: build/android/few-turns.aab
+          track: internal
+          status: completed
+
+      - name: Old addresses (gh-pages)
+        # theramlakhan.com/few-turns/... now redirects to Brainnova Studio. The privacy
+        # address registered in Play Console keeps answering.
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: stubs
+          force_orphan: true
+          commit_message: "Publish build ${{ github.run_number }}"
